@@ -24,7 +24,7 @@ pip install onnxruntime-gpu
 ### Test
 
 * Configure your exported onnx model path and image path in `main.py` for testing
-* Run `python main.py --demo` for testing
+* Run `python main.py --test` for testing
 
 #### Reference
 
