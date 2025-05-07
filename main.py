@@ -144,6 +144,11 @@ def test(args):
     for output in outputs:
         x, y, w, h, score, index = output
         cv2.rectangle(frame, (int(x), int(y)), (int(x + w), int(y + h)), (0, 255, 0), 2)
+
+        cv2.putText(frame,
+                    text=f'{index}: {score * 100:.1f}%', org=(x, max(y - 10, 0)),
+                    fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1.25,
+                    color=(255, 0, 255), thickness=2, lineType=cv2.LINE_AA)
     cv2.imwrite('output.jpg', frame)
 
 
