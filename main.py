@@ -4,6 +4,7 @@ from argparse import ArgumentParser
 
 import cv2
 import numpy
+from onnxruntime import InferenceSession
 
 warnings.filterwarnings("ignore")
 
@@ -14,11 +15,10 @@ class ONNXDetect:
         if self.session is None:
             assert onnx_path is not None
             assert os.path.exists(onnx_path)
-            from onnxruntime import InferenceSession
             self.session = InferenceSession(onnx_path,
                                             providers=['CUDAExecutionProvider'])
 
-        self.inputs = self.session.get_inputs()[0]
+        self.inputs = self.session.get_inputs()[0].name
         self.confidence_threshold = 0.25
         self.iou_threshold = 0.7
         self.input_size = args.input_size
@@ -26,50 +26,51 @@ class ONNXDetect:
         image = numpy.zeros(shape, dtype='float32')
         for _ in range(10):
             self.session.run(output_names=None,
-                             input_feed={self.inputs.name: image})
+                             input_feed={self.inputs: image})
 
     def __call__(self, image):
-        image, scale = self.resize(image, self.input_size)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = image.transpose((2, 0, 1))[::-1]
-        image = image.astype('float32') / 255
-        image = image[numpy.newaxis, ...]
+        x, pad, gain = self.resize(image, image.shape)
+        x = x.transpose((2, 0, 1))[::-1]
+        x = x.astype('float32') / 255
+        x = x[numpy.newaxis, ...]
 
         outputs = self.session.run(output_names=None,
-                                   input_feed={self.inputs.name: image})
-        outputs = numpy.transpose(numpy.squeeze(outputs[0]))
+                                   input_feed={self.inputs: x})[0]
+        outputs = outputs[0].transpose(1, 0)
 
-        # Lists to store the bounding boxes, scores, and class IDs of the detections
-        boxes = []
-        scores = []
-        class_indices = []
+        outputs[:, 0] -= pad[1]
+        outputs[:, 1] -= pad[0]
 
-        # Iterate over each row in the outputs array
-        for i in range(outputs.shape[0]):
-            # Extract the class scores from the current row
-            classes_scores = outputs[i][4:]
+        # Extract class scores (all rows, columns 4 onwards)
+        class_scores = outputs[:, 4:]  # Shape: (8400, num_classes)
 
-            # Find the maximum score among the class scores
-            max_score = numpy.amax(classes_scores)
+        # Find maximum score and corresponding class ID for each detection
+        max_scores = numpy.amax(class_scores, axis=1)  # Shape: (8400,)
+        class_indices = numpy.argmax(class_scores, axis=1)  # Shape: (8400,)
 
-            # If the maximum score is above the confidence threshold
-            if max_score >= self.confidence_threshold:
-                # Get the class ID with the highest score
-                class_id = numpy.argmax(classes_scores)
+        # Filter detections based on confidence threshold
+        mask = max_scores >= self.confidence_threshold
+        if not numpy.any(mask):
+            return []
 
-                # Extract the bounding box coordinates from the current row
-                image, y, w, h = outputs[i][0], outputs[i][1], outputs[i][2], outputs[i][3]
+        # Apply mask to filter valid detections
+        outputs = outputs[mask]  # Shape: (N, 4 + num_classes)
+        scores = max_scores[mask]  # Shape: (N,)
+        class_indices = class_indices[mask]  # Shape: (N,)
 
-                # Calculate the scaled coordinates of the bounding box
-                left = int((image - w / 2) / scale)
-                top = int((y - h / 2) / scale)
-                width = int(w / scale)
-                height = int(h / scale)
+        # Extract bounding box coordinates (cx, cy, w, h)
+        cx, cy, w, h = outputs[:, 0], outputs[:, 1], outputs[:, 2], outputs[:, 3]
 
-                # Add the class ID, score, and box coordinates to the respective lists
-                class_indices.append(class_id)
-                scores.append(max_score)
-                boxes.append([left, top, width, height])
+        # Calculate scaled bounding box coordinates
+        left = ((cx - w / 2) / gain).astype(int)
+        top = ((cy - h / 2) / gain).astype(int)
+        width = (w / gain).astype(int)
+        height = (h / gain).astype(int)
+
+        # Stack boxes into list of [left, top, width, height]
+        boxes = numpy.stack(arrays=[left, top, width, height], axis=1).tolist()
+        scores = scores.tolist()
+        class_indices = class_indices.tolist()
 
         # Apply non-maximum suppression to filter out overlapping bounding boxes
         indices = cv2.dnn.NMSBoxes(boxes, scores, self.confidence_threshold, self.iou_threshold)
@@ -84,22 +85,20 @@ class ONNXDetect:
             nms_outputs.append([*box, score, class_id])
         return nms_outputs
 
-    @staticmethod
-    def resize(image, input_size):
-        shape = image.shape
+    def resize(self, image, shape):
+        r = min(self.input_size / shape[0], self.input_size / shape[1])
 
-        ratio = float(shape[0]) / shape[1]
-        if ratio > 1:
-            h = input_size
-            w = int(h / ratio)
-        else:
-            w = input_size
-            h = int(w * ratio)
-        scale = float(h) / shape[0]
-        resized_image = cv2.resize(image, (w, h))
-        det_image = numpy.zeros((input_size, input_size, 3), dtype=numpy.uint8)
-        det_image[:h, :w, :] = resized_image
-        return det_image, scale
+        # Compute padding
+        pad = int(round(shape[1] * r)), int(round(shape[0] * r))
+        w = (self.input_size - pad[0]) / 2  # w padding
+        h = (self.input_size - pad[1]) / 2  # h padding
+
+        if shape[::-1] != pad:
+            image = cv2.resize(image, pad, interpolation=cv2.INTER_LINEAR)
+        top, bottom = int(round(h - 0.1)), int(round(h + 0.1))
+        left, right = int(round(w - 0.1)), int(round(w + 0.1))
+        image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        return image, (top, left), min(self.input_size / shape[0], self.input_size / shape[1])
 
 
 def export(args):
